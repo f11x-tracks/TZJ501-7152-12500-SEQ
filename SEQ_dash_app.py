@@ -40,6 +40,25 @@ COATER_TO_DECK_MAPPING = {
 
 def load_test_data():
     """Load TEST data from XML files"""
+    # Load spin speed adjustment data
+    spin_adjustments = {}
+    try:
+        if os.path.exists('spin-speed-adjust.txt'):
+            with open('spin-speed-adjust.txt', 'r') as f:
+                lines = f.readlines()
+                if len(lines) > 1:  # Skip header line
+                    for line in lines[1:]:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 9:  # FileName + 8 wafer adjustments
+                            filename = parts[0]
+                            adjustments = [float(x) if x else 0 for x in parts[1:9]]
+                            spin_adjustments[filename] = adjustments
+            print(f"Loaded spin speed adjustments for {len(spin_adjustments)} files")
+        else:
+            print("No spin-speed-adjust.txt file found, proceeding without adjustments")
+    except Exception as e:
+        print(f"Error loading spin speed adjustments: {e}")
+    
     # Directories to search - using TEST directory
     dirs = ['TEST']  # TEST directory for XML files
     patterns = ['*.xml']  # All XML files in the directory
@@ -55,6 +74,7 @@ def load_test_data():
     # Collect data
     records = []
     processed_files = []  # Track successfully processed files
+    adjustment_summary = {}  # Track applied adjustments for reporting
 
     for file in files:
         try:
@@ -111,6 +131,25 @@ def load_test_data():
                         # Round Layer 1 Thickness to 1 decimal place
                         if label == 'Layer 1 Thickness':
                             datum_val = round(datum_val, 1)
+                            
+                            # Apply spin speed adjustment if available
+                            if filename in spin_adjustments:
+                                wafer_order_index = wafer_order.get(wafer_id, 0)
+                                if 0 <= wafer_order_index < len(spin_adjustments[filename]):
+                                    adjustment = spin_adjustments[filename][wafer_order_index]
+                                    original_val = datum_val
+                                    datum_val = round(datum_val + adjustment, 1)
+                                    
+                                    # Track adjustments for reporting
+                                    if filename not in adjustment_summary:
+                                        adjustment_summary[filename] = []
+                                    adjustment_summary[filename].append({
+                                        'wafer_position': wafer_order_index + 1,  # 1-indexed for display
+                                        'wafer_id': wafer_id,
+                                        'adjustment': adjustment,
+                                        'original': original_val,
+                                        'adjusted': datum_val
+                                    })
                         
                         # Create a unique location identifier for pairing measurements
                         location_id = f"{x_wafer_loc}_{y_wafer_loc}" if x_wafer_loc and y_wafer_loc else None
@@ -164,6 +203,39 @@ def load_test_data():
         except Exception as e:
             print(f"Error processing file {file}: {e}")
             continue
+
+    # Report spin speed adjustment summary
+    if adjustment_summary:
+        print(f"\n=== SPIN SPEED ADJUSTMENTS APPLIED ===")
+        total_adjustments = 0
+        for filename, adjustments in adjustment_summary.items():
+            print(f"File: {filename}")
+            wafer_summary = {}
+            for adj in adjustments:
+                pos = adj['wafer_position']
+                if pos not in wafer_summary:
+                    wafer_summary[pos] = {'count': 0, 'adjustment': adj['adjustment']}
+                wafer_summary[pos]['count'] += 1
+                total_adjustments += 1
+            
+            for pos in sorted(wafer_summary.keys()):
+                info = wafer_summary[pos]
+                print(f"  Wafer {pos}: {info['adjustment']:+.1f} Å adjustment applied to {info['count']} measurements")
+        
+        print(f"Total: {total_adjustments} thickness measurements adjusted across {len(adjustment_summary)} files")
+        
+        # Show which files from spin-speed-adjust.txt had NO matches
+        unmatched_files = set(spin_adjustments.keys()) - set(adjustment_summary.keys())
+        if unmatched_files:
+            print(f"\nFiles in spin-speed-adjust.txt with NO matches in TEST data:")
+            for file in sorted(unmatched_files):
+                print(f"  - {file}")
+    else:
+        if spin_adjustments:
+            print(f"\nNo matches found between {len(spin_adjustments)} files in spin-speed-adjust.txt and TEST data")
+        else:
+            print(f"\nNo spin speed adjustments available (spin-speed-adjust.txt empty or not found)")
+    print("=" * 50)
 
     return pd.DataFrame(records), processed_files
 
@@ -1283,6 +1355,153 @@ def make_test_radius_spline_plot(selected_files=None, offset=0):
     
     return dcc.Graph(figure=fig)
 
+
+def make_test_coater_spline_plot(selected_files=None, offset=0):
+    """Create spline plot of TEST thickness vs radius by individual COATER for selected files"""
+    from scipy.interpolate import UnivariateSpline
+    
+    # Apply offset to TEST data
+    modified_test_df = apply_offset_to_test_data(test_df, offset)
+    
+    if modified_test_df.empty:
+        return html.Div("No TEST data available for spline analysis")
+    
+    # Filter for thickness data only
+    thickness_data = modified_test_df[modified_test_df['Label'] == 'Layer 1 Thickness'].copy()
+    
+    if thickness_data.empty:
+        return html.Div("No TEST thickness data available")
+    
+    # Filter by selected files if specified
+    if selected_files:
+        thickness_data = thickness_data[thickness_data['FileName'].isin(selected_files)]
+        
+    if thickness_data.empty:
+        return html.Div("No data available for selected files")
+    
+    # Filter for valid radius data (0-150mm)
+    thickness_data = thickness_data[
+        (thickness_data['RADIUS'].notna()) & 
+        (thickness_data['RADIUS'] >= 0) & 
+        (thickness_data['RADIUS'] <= 150)
+    ].copy()
+    
+    if thickness_data.empty:
+        return html.Div("No thickness data with valid radius (0-150mm) available")
+    
+    # Create the spline plot
+    fig = go.Figure()
+    
+    # Define colors for each COATER (8 distinct colors)
+    coater_colors = {
+        '1301': '#1f77b4',  # Blue
+        '1302': '#ff7f0e',  # Orange  
+        '1303': '#2ca02c',  # Green
+        '1304': '#d62728',  # Red
+        '1401': '#9467bd',  # Purple
+        '1402': '#8c564b',  # Brown
+        '1403': '#e377c2',  # Pink
+        '1404': '#7f7f7f'   # Gray
+    }
+    
+    # Create splines for each COATER
+    for coater in sorted(thickness_data['COATER'].unique()):
+        coater_data = thickness_data[thickness_data['COATER'] == coater]
+        
+        if len(coater_data) < 4:  # Need at least 4 points for spline
+            continue
+            
+        # Sort by radius for proper spline fitting
+        coater_data = coater_data.sort_values('RADIUS')
+        
+        # Create spline
+        try:
+            # Use moderate smoothing (s parameter)
+            spline = UnivariateSpline(coater_data['RADIUS'], coater_data['Datum'], s=len(coater_data)*2)
+            
+            # Generate smooth curve points
+            radius_smooth = np.linspace(coater_data['RADIUS'].min(), coater_data['RADIUS'].max(), 100)
+            thickness_smooth = spline(radius_smooth)
+            
+            # Add raw data points
+            fig.add_trace(go.Scatter(
+                x=coater_data['RADIUS'],
+                y=coater_data['Datum'],
+                mode='markers',
+                name=f'{coater} Data',
+                marker=dict(
+                    size=8,
+                    color=coater_colors.get(coater, '#666666'),
+                    opacity=0.6
+                ),
+                hovertemplate=f'<b>COATER {coater} Data</b><br>' +
+                              'Radius: %{x:.1f} mm<br>' +
+                              'Thickness: %{y:.1f} Å<br>' +
+                              '<extra></extra>'
+            ))
+            
+            # Add spline curve
+            fig.add_trace(go.Scatter(
+                x=radius_smooth,
+                y=thickness_smooth,
+                mode='lines',
+                name=f'{coater} Spline',
+                line=dict(
+                    width=3,
+                    color=coater_colors.get(coater, '#666666')
+                ),
+                hovertemplate=f'<b>COATER {coater} Spline</b><br>' +
+                              'Radius: %{x:.1f} mm<br>' +
+                              'Thickness: %{y:.1f} Å<br>' +
+                              '<extra></extra>'
+            ))
+            
+        except Exception as e:
+            # If spline fails, just show raw data
+            fig.add_trace(go.Scatter(
+                x=coater_data['RADIUS'],
+                y=coater_data['Datum'],
+                mode='markers+lines',
+                name=f'{coater} (Linear)',
+                marker=dict(size=8, color=coater_colors.get(coater, '#666666')),
+                line=dict(width=2, color=coater_colors.get(coater, '#666666')),
+                hovertemplate=f'<b>COATER {coater}</b><br>' +
+                              'Radius: %{x:.1f} mm<br>' +
+                              'Thickness: %{y:.1f} Å<br>' +
+                              '<extra></extra>'
+            ))
+    
+    # Create title with file info
+    file_info = f" ({len(selected_files)} files selected)" if selected_files else " (All files)"
+    title_text = f'TEST Thickness vs Radius by COATER{file_info}'
+    if offset != 0:
+        title_text += f' (Offset: {offset:+.1f} Å)'
+    
+    # Update layout
+    fig.update_layout(
+        title=title_text,
+        xaxis_title='Radius from Center (mm)',
+        yaxis_title='Layer 1 Thickness (Angstrom)',
+        xaxis=dict(
+            range=[0, 150],
+            showgrid=True
+        ),
+        yaxis=dict(showgrid=True),
+        height=600,
+        margin=dict(l=50, r=50, t=80, b=50),
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.02
+        )
+    )
+    
+    return dcc.Graph(figure=fig)
+
+
 def make_por_radius_spline_plot(selected_entities=None):
     """Create spline plot of POR thickness vs radius by COATER for selected entities"""
     from scipy.interpolate import UnivariateSpline
@@ -1467,6 +1686,79 @@ def make_files_table():
         table
     ])
 
+# ===== CSV EXPORT FUNCTION =====
+
+def create_deck_csv_export(offset=0, target_thickness=12500):
+    """Create CSV export data for DECK analysis: Target Thickness - Mean thickness by File Name and DECK"""
+    if test_df.empty:
+        return None
+    
+    # Apply offset to TEST data
+    modified_test_df = apply_offset_to_test_data(test_df, offset)
+    
+    # Filter for thickness data only
+    thickness_data = modified_test_df[modified_test_df['Label'] == 'Layer 1 Thickness'].copy()
+    
+    if thickness_data.empty:
+        return None
+    
+    # Add DECK column based on COATER mapping
+    thickness_data['DECK'] = thickness_data['COATER'].map(COATER_TO_DECK_MAPPING)
+    
+    # Remove any data that doesn't map to a deck
+    thickness_data = thickness_data.dropna(subset=['DECK'])
+    
+    if thickness_data.empty:
+        return None
+    
+    # Get unique file names sorted by datetime
+    files_with_time = thickness_data.groupby('FileName')['datetime'].first().sort_values()
+    file_names = files_with_time.index.tolist()
+    
+    # Define DECK order
+    deck_order = ['13-L', '13-R', '14-L', '14-R']
+    
+    # Create CSV data
+    csv_rows = []
+    
+    # Header row
+    header = ['File Name'] + deck_order
+    csv_rows.append(','.join(header))
+    
+    for filename in file_names:
+        row_data = [filename]
+        
+        # Get data for this file
+        file_data = thickness_data[thickness_data['FileName'] == filename]
+        
+        for deck in deck_order:
+            deck_data = file_data[file_data['DECK'] == deck]['Datum']
+            
+            if len(deck_data) > 0:
+                mean_thickness = deck_data.mean()
+                # Calculate Target Thickness - Mean thickness
+                deviation = round(target_thickness - mean_thickness, 1)
+                row_data.append(str(deviation))
+            else:
+                row_data.append('')  # Empty if no data for this deck
+        
+        csv_rows.append(','.join(row_data))
+    
+    # Save CSV file to project folder
+    offset_info = f"_offset{offset:+.1f}" if offset != 0 else ""
+    target_info = f"_target{target_thickness}"
+    filename = f"DECK_Analysis{target_info}{offset_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    csv_content = '\n'.join(csv_rows)
+    
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            f.write(csv_content)
+        return filename
+    except Exception as e:
+        print(f"Error saving CSV file: {e}")
+        return None
+
 # ===== EXCEL EXPORT FUNCTIONS =====
 
 def create_test_export_excel(offset=0):
@@ -1543,30 +1835,103 @@ def create_test_export_excel(offset=0):
     # Create DataFrame
     export_df = pd.DataFrame(export_data, columns=columns)
     
-    # Create Excel file in memory
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        export_df.to_excel(writer, sheet_name='TEST Statistical Summary', index=False)
-        
-        # Get workbook and worksheet for formatting
-        workbook = writer.book
-        worksheet = writer.sheets['TEST Statistical Summary']
-        
-        # Auto-adjust column widths
-        for column in worksheet.columns:
-            max_length = 0
-            column = [cell for cell in column]
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 40)  # Cap at 40
-            worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+    # Save Excel file to project folder
+    offset_info = f"_offset{offset:+.1f}" if offset != 0 else ""
+    filename = f"TEST_Statistical_Summary{offset_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     
-    output.seek(0)
-    return output.getvalue()
+    try:
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            export_df.to_excel(writer, sheet_name='TEST Statistical Summary', index=False)
+            
+            # Get workbook and worksheet for formatting
+            workbook = writer.book
+            worksheet = writer.sheets['TEST Statistical Summary']
+            
+            # Auto-adjust column widths
+            for column in worksheet.columns:
+                max_length = 0
+                column = [cell for cell in column]
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 40)  # Cap at 40
+                worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+        
+        return filename
+    except Exception as e:
+        print(f"Error saving Excel file: {e}")
+        return None
+
+def create_test_raw_data_export(offset=0):
+    """Create Excel export with raw TEST data including all measurements"""
+    if test_df.empty:
+        return None
+    
+    # Apply offset to TEST data
+    modified_test_df = apply_offset_to_test_data(test_df, offset)
+    
+    # Export both Layer 1 Thickness and Goodness-of-Fit data
+    export_df = modified_test_df.copy()
+    
+    # Reorder columns for better readability
+    column_order = [
+        'datetime', 'FileName', 'dmt', 'LotNumber', 'Entity', 'WaferID', 'Slot',
+        'COATER', 'Label', 'Datum', 'XWaferLoc', 'YWaferLoc', 'RADIUS', 'Source'
+    ]
+    
+    # Include only columns that exist in the DataFrame
+    existing_columns = [col for col in column_order if col in export_df.columns]
+    remaining_columns = [col for col in export_df.columns if col not in existing_columns]
+    final_columns = existing_columns + remaining_columns
+    
+    export_df = export_df[final_columns]
+    
+    # Sort by datetime, then by filename, then by wafer order
+    export_df = export_df.sort_values(['datetime', 'FileName', 'WaferID'])
+    
+    # Save Excel file to project folder
+    offset_info = f"_offset{offset:+.1f}" if offset != 0 else ""
+    filename = f"TEST_Raw_Data{offset_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    try:
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Export all data to one sheet
+            export_df.to_excel(writer, sheet_name='TEST Raw Data', index=False)
+            
+            # Also create separate sheets for Layer 1 Thickness and Goodness-of-Fit
+            thickness_data = export_df[export_df['Label'] == 'Layer 1 Thickness']
+            if not thickness_data.empty:
+                thickness_data.to_excel(writer, sheet_name='Layer 1 Thickness', index=False)
+            
+            goodness_data = export_df[export_df['Label'] == 'Goodness-of-Fit']
+            if not goodness_data.empty:
+                goodness_data.to_excel(writer, sheet_name='Goodness-of-Fit', index=False)
+            
+            # Get workbook for formatting
+            workbook = writer.book
+            
+            # Auto-adjust column widths for all sheets
+            for sheet_name in writer.sheets:
+                worksheet = writer.sheets[sheet_name]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column = [cell for cell in column]
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 40)  # Cap at 40
+                    worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+        
+        return filename
+    except Exception as e:
+        print(f"Error saving raw TEST data Excel file: {e}")
+        return None
 
 def create_test_summary_table_data(offset=0):
     """Create table data for TEST statistics by COATER and File Name matching Excel export format"""
@@ -1729,6 +2094,22 @@ app.layout = html.Div([
         ], style={'padding': '15px', 'backgroundColor': '#fff2cc', 'border': '1px solid #d6b656', 'borderRadius': '5px'})
     ], style={'marginBottom': '20px'}) if por_df.empty else html.Div(),
     
+    # Target Thickness Control
+    html.Div([
+        html.H3("Target Thickness"),
+        html.Div([
+            html.Label("Target Thickness (Angstrom): ", style={'marginRight': '10px'}),
+            dcc.Input(
+                id='target-thickness-input',
+                type='number',
+                value=12500,
+                step=1,
+                style={'width': '150px', 'display': 'inline-block', 'padding': '5px'}
+            ),
+            html.Span(" (Reference value for analysis)", style={'marginLeft': '10px', 'fontStyle': 'italic'})
+        ], style={'display': 'flex', 'alignItems': 'center'})
+    ], style={'margin': '20px 0', 'padding': '15px', 'backgroundColor': '#f0f8e8', 'borderRadius': '5px', 'border': '2px solid #28a745'}),
+    
     # Matching Offset Controls
     html.Div([
         html.H3("Matching Offset Control"),
@@ -1781,10 +2162,11 @@ app.layout = html.Div([
     
     # TEST Data Export
     html.H2("TEST Data Export"),
+    # Statistical Summary Export
     html.Div([
         html.P("Export TEST data statistical summary to Excel format with metrics by COATER and File Name."),
         html.Button(
-            "Export TEST Data to Excel",
+            "Export TEST Statistical Summary",
             id="export-button",
             n_clicks=0,
             style={
@@ -1797,9 +2179,28 @@ app.layout = html.Div([
                 'fontSize': '14px',
                 'marginBottom': '15px'
             }
-        ),
-        dcc.Download(id="download-dataframe-xlsx")
+        )
     ], style={'margin': '15px 0', 'padding': '15px', 'backgroundColor': '#f0f8ff', 'borderRadius': '5px'}),
+    
+    # Raw Data Export
+    html.Div([
+        html.P("Export all raw TEST measurement data to Excel format with separate sheets for Layer 1 Thickness and Goodness-of-Fit."),
+        html.Button(
+            "Export TEST Raw Data to Excel",
+            id="export-raw-button",
+            n_clicks=0,
+            style={
+                'backgroundColor': '#28a745',
+                'color': 'white',
+                'padding': '10px 20px',
+                'border': 'none',
+                'borderRadius': '5px',
+                'cursor': 'pointer',
+                'fontSize': '14px',
+                'marginBottom': '15px'
+            }
+        )
+    ], style={'margin': '15px 0', 'padding': '15px', 'backgroundColor': '#f0f9f0', 'borderRadius': '5px'}),
     
     html.Hr(),
     
@@ -1830,6 +2231,26 @@ app.layout = html.Div([
     ], style={'fontSize': '12px', 'fontStyle': 'italic', 'marginBottom': '15px'}),
     html.Div(id='test-deck-time-series'),
     
+    # Export button for DECK time series data
+    html.Div([
+        html.P("Export deviation from target thickness by DECK and File Name to CSV format."),
+        html.Button(
+            "Export DECK Analysis to CSV",
+            id="export-deck-button", 
+            n_clicks=0,
+            style={
+                'backgroundColor': '#28a745',
+                'color': 'white',
+                'padding': '10px 20px',
+                'border': 'none',
+                'borderRadius': '5px',
+                'cursor': 'pointer',
+                'fontSize': '14px',
+                'marginBottom': '15px'
+            }
+        )
+    ], style={'margin': '15px 0', 'padding': '10px', 'backgroundColor': '#f8f9fa', 'borderRadius': '5px'}),
+    
     html.Hr(),
     
     # TEST Radius Spline Analysis
@@ -1853,6 +2274,28 @@ app.layout = html.Div([
     ], style={'margin': '15px 0'}),
     
     html.Div(id='test-radius-spline'),
+    
+    html.Hr(),
+    
+    # TEST Radius Spline Analysis by COATER
+    html.H2("TEST Thickness vs Radius by COATER (Spline Analysis)"),
+    html.P([
+        "Interactive spline analysis showing thickness uniformity across wafer radius (0-150mm) by individual COATER. ",
+        "Uses the same file selection as the DECK analysis above."
+    ], style={'fontSize': '14px', 'marginBottom': '15px'}),
+    
+    html.Div(id='test-coater-spline'),
+    
+    html.Hr(),
+    
+    # TEST Radius Spline Analysis by COATER
+    html.H2("TEST Thickness vs Radius by COATER (Spline Analysis)"),
+    html.P([
+        "Interactive spline analysis showing thickness uniformity across wafer radius (0-150mm) by individual COATER. ",
+        "Uses the same file selection as the DECK analysis above."
+    ], style={'fontSize': '14px', 'marginBottom': '15px'}),
+    
+    html.Div(id='test-coater-spline'),
     
     html.Hr(),
     
@@ -1894,6 +2337,7 @@ app.layout = html.Div([
      Output('test-time-series', 'children'),
      Output('test-deck-time-series', 'children'),
      Output('test-radius-spline', 'children'),
+     Output('test-coater-spline', 'children'),
      Output('por-radius-spline', 'children')],
     [Input('offset-dropdown', 'value'),
      Input('spline-file-dropdown', 'value'),
@@ -1909,27 +2353,61 @@ def update_plots(offset, selected_files, selected_entities):
         make_test_time_series_plot(offset),
         make_test_deck_time_series_plot(offset),
         make_test_radius_spline_plot(selected_files, offset),
+        make_test_coater_spline_plot(selected_files, offset),
         make_por_radius_spline_plot(selected_entities)
     )
 
-# Callback for Excel export
+# Callback for Excel statistical summary export
 @app.callback(
-    Output("download-dataframe-xlsx", "data"),
+    Output("export-button", "children"),
     [Input("export-button", "n_clicks"),
      Input('offset-dropdown', 'value')],
     prevent_initial_call=True,
 )
 def generate_excel_export(n_clicks, offset):
-    """Generate and download Excel file with TEST data statistics including offset adjustment"""
+    """Generate Excel file with TEST data statistics and save to project folder"""
     if n_clicks > 0:
-        excel_data = create_test_export_excel(offset)
-        if excel_data:
-            offset_info = f"_offset{offset:+.1f}" if offset != 0 else ""
-            return dcc.send_bytes(
-                excel_data,
-                f"TEST_Statistical_Summary{offset_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-    return None
+        filename = create_test_export_excel(offset)
+        if filename:
+            return f"✓ Exported: {filename}"
+        else:
+            return "❌ Export Failed"
+    return "Export TEST Statistical Summary"
+
+# Callback for raw data Excel export
+@app.callback(
+    Output("export-raw-button", "children"),
+    [Input("export-raw-button", "n_clicks"),
+     Input('offset-dropdown', 'value')],
+    prevent_initial_call=True,
+)
+def generate_raw_excel_export(n_clicks, offset):
+    """Generate Excel file with all raw TEST measurement data and save to project folder"""
+    if n_clicks > 0:
+        filename = create_test_raw_data_export(offset)
+        if filename:
+            return f"✓ Exported: {filename}"
+        else:
+            return "❌ Export Failed"
+    return "Export TEST Raw Data to Excel"
+
+# Callback for CSV DECK export
+@app.callback(
+    Output("export-deck-button", "children"),
+    [Input("export-deck-button", "n_clicks"),
+     Input('offset-dropdown', 'value'),
+     Input('target-thickness-input', 'value')],
+    prevent_initial_call=True,
+)
+def generate_deck_csv_export(n_clicks, offset, target_thickness):
+    """Generate CSV file with DECK analysis data and save to project folder"""
+    if n_clicks > 0:
+        filename = create_deck_csv_export(offset, target_thickness or 12500)
+        if filename:
+            return f"✓ Exported: {filename}"
+        else:
+            return "❌ Export Failed"
+    return "Export DECK Analysis to CSV"
 
 if __name__ == '__main__':
     print(f"\nData Loading Summary:")

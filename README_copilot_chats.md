@@ -19,3 +19,11 @@ copy the TEST Date Time Series and create another chart that is grouped by DECK.
 for the TEST data add a spline where it plots the thickness by DECK. X axis is radius from 0-150mm. and add a drop down so i can select one or multiple 'File Name' to plot. 
 
 add an option to export the TEST data to excel. it should have Statistical Summary by COATER. each row should be data from one of the File Name. So there should be a row for each File Name in TEST. There should be 24 columns. 8 COAT and 3 columns for each COAT. The columns should be 1301 Mean Thickness (Å), 1301 Avg delta to previous run (will be blank for first row), 1301 std dev. then next 3 columns are same columns but for 1401, then 1303, 1403, 1302, 1402, 1304, 1404. 
+
+add a field at the beginning, near matching offset control, where I can type in the target thickness. call it 'Target Thickness'
+
+set a default value of 12500 for the Target Thickness field. for TEST Data Time Series by DECK add an option to export a comma delimited file where each row is a File Name and then there are 4 columns for the decks, 13-L, 13-R, 14-L, 14-R. and the data will be Target Thickness - Mean thickness for that File Name and specific Deck.
+
+can you have it export inside the project folder
+
+when loading the TEST data. check spin-speed-adjust.txt for any offset to apply to the raw data. if FileName matches then read the offset to apply for the 1st, 2nd, 3rd, 4th, 5th, 6th, 7th, 8th wafer (in columns)
